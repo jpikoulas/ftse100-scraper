@@ -1,0 +1,4 @@
+# Run FTSE 100 scraper every 2 minutes
+*/2 * * * * cd /app && echo "[$(date)] Starting scheduled scrape..." >> /var/log/cron.log && /usr/local/bin/python /app/scraper.py >> /var/log/cron.log 2>&1
+
+# Empty line required at end

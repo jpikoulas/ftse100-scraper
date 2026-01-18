@@ -1,0 +1,11 @@
+services:
+  ftse100-scraper:
+    build: .
+    container_name: ftse100-scraper
+    environment:
+      - CLICKHOUSE_HOST=10.10.1.30
+      - CLICKHOUSE_PORT=8333
+      - CLICKHOUSE_USER=johnp
+      - CLICKHOUSE_PASSWORD=test123
+      - CLICKHOUSE_DATABASE=garden
+    restart: unless-stopped
