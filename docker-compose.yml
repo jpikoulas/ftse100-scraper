@@ -9,3 +9,11 @@ services:
       - CLICKHOUSE_PASSWORD=test123
       - CLICKHOUSE_DATABASE=garden
     restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+        reservations:
+          cpus: '0.25'
+          memory: 256M
