@@ -23,11 +23,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Configuration
-CLICKHOUSE_HOST = os.getenv('CLICKHOUSE_HOST', '10.10.1.30')
-CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_PORT', '8333'))
-CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'johnp')
-CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'test123')
-CLICKHOUSE_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'garden')
+CLICKHOUSE_HOST = os.getenv('CLICKHOUSE_HOST', '10.10.1.205')
+CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_PORT', '8123'))
+CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
+CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'B---5')
+CLICKHOUSE_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'default')
 
 # LSE uses page parameter in URL
 LSE_BASE_URL = "https://www.londonstockexchange.com/indices/ftse-100/constituents/table"
