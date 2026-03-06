@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
 FTSE 100 Stock Scraper
-Fetches FTSE 100 constituents data and stores it in ClickHouse
+Fetches FTSE 100 constituents data and stores it in ClickHouse,
+then publishes each record to NATS JetStream for downstream consumers.
 """
 
 import os
 import time
+import json
 import logging
+import asyncio
 from datetime import datetime
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
@@ -15,6 +18,8 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, NoSuchElementException, StaleElementReferenceException
 import clickhouse_connect
+import nats
+from nats.js.api import StreamConfig, RetentionPolicy
 
 logging.basicConfig(
     level=logging.INFO,
@@ -28,6 +33,9 @@ CLICKHOUSE_PORT = int(os.getenv('CLICKHOUSE_PORT', '8123'))
 CLICKHOUSE_USER = os.getenv('CLICKHOUSE_USER', 'default')
 CLICKHOUSE_PASSWORD = os.getenv('CLICKHOUSE_PASSWORD', 'B---5')
 CLICKHOUSE_DATABASE = os.getenv('CLICKHOUSE_DATABASE', 'default')
+
+NATS_URL = os.getenv('NATS_URL', 'nats://nats.nats.svc.cluster.local:4222')
+NATS_SUBJECT = os.getenv('NATS_SUBJECT', 'ftse.prices')
 
 # LSE uses page parameter in URL
 LSE_BASE_URL = "https://www.londonstockexchange.com/indices/ftse-100/constituents/table"
@@ -136,12 +144,10 @@ def click_next_page(driver, wait, current_page):
 
     # Method 1: Try clicking the page number directly
     try:
-        # Look for pagination buttons/links
         pagination_container = driver.find_elements(By.CSS_SELECTOR,
             "nav[aria-label*='pagination'], .pagination, [class*='paginator'], [class*='paging']")
 
         for container in pagination_container:
-            # Try to find the next page number
             page_buttons = container.find_elements(By.XPATH,
                 f".//*[contains(text(), '{next_page}') and (self::button or self::a or self::span)]")
 
@@ -162,8 +168,6 @@ def click_next_page(driver, wait, current_page):
             "a[aria-label*='next' i]",
             "[class*='next']",
             "[class*='forward']",
-            "button:has(mat-icon:contains('chevron_right'))",
-            "button:has(mat-icon:contains('arrow_forward'))",
         ]
 
         for selector in next_selectors:
@@ -180,9 +184,8 @@ def click_next_page(driver, wait, current_page):
     except Exception as e:
         logger.debug(f"Method 2 failed: {e}")
 
-    # Method 3: Try using keyboard navigation or Angular-specific navigation
+    # Method 3: XPath fallback
     try:
-        # Find any clickable element that might be a next button using XPath
         next_elements = driver.find_elements(By.XPATH,
             "//*[contains(@class, 'next') or contains(@aria-label, 'next') or contains(@aria-label, 'Next')]")
 
@@ -193,7 +196,7 @@ def click_next_page(driver, wait, current_page):
     except Exception as e:
         logger.debug(f"Method 3 failed: {e}")
 
-    # Method 4: Try to find mat-paginator (Angular Material)
+    # Method 4: Angular Material paginator
     try:
         paginator = driver.find_element(By.CSS_SELECTOR, "mat-paginator, [class*='mat-paginator']")
         next_btn = paginator.find_element(By.CSS_SELECTOR,
@@ -231,8 +234,7 @@ def scrape_ftse100():
         wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr")))
         time.sleep(3)
 
-        # Scrape pages
-        max_pages = 6  # Safety limit
+        max_pages = 6
         current_page = 1
         previous_first_code = None
         consecutive_failures = 0
@@ -240,7 +242,6 @@ def scrape_ftse100():
         while current_page <= max_pages and consecutive_failures < 3:
             logger.info(f"Scraping page {current_page}")
 
-            # Wait for table to be ready
             first_code = wait_for_table_update(driver, wait, previous_first_code if current_page > 1 else None)
 
             if current_page > 1 and first_code == previous_first_code:
@@ -251,10 +252,8 @@ def scrape_ftse100():
 
             consecutive_failures = 0
 
-            # Scrape current page
             page_stocks = scrape_current_page(driver)
 
-            # Filter out duplicates
             new_stocks = []
             for stock in page_stocks:
                 if stock['code'] not in seen_codes:
@@ -269,15 +268,13 @@ def scrape_ftse100():
 
             previous_first_code = first_code
 
-            # Check if we have enough stocks (FTSE 100 = ~100 stocks)
             if len(all_stocks) >= 100:
                 logger.info("Reached 100 stocks, stopping")
                 break
 
-            # Try to go to next page
             if current_page < max_pages:
                 if click_next_page(driver, wait, current_page):
-                    time.sleep(2)  # Wait for page transition
+                    time.sleep(2)
                 else:
                     logger.warning(f"Could not navigate to page {current_page + 1}")
                     break
@@ -306,7 +303,6 @@ def init_clickhouse():
         database=CLICKHOUSE_DATABASE
     )
 
-    # Create table if not exists
     create_table_sql = """
     CREATE TABLE IF NOT EXISTS ftse100_indexes (
         code String,
@@ -333,7 +329,6 @@ def save_to_clickhouse(client, stocks):
         logger.warning("No stocks to save")
         return
 
-    # Prepare data for insertion
     data = [
         (
             s['code'],
@@ -357,19 +352,57 @@ def save_to_clickhouse(client, stocks):
     logger.info(f"Saved {len(stocks)} stocks to ClickHouse")
 
 
+async def publish_to_nats(stocks):
+    """Publish each stock record to NATS JetStream stream 'ftse'."""
+    nc = await nats.connect(NATS_URL)
+    js = nc.jetstream()
+
+    # Ensure stream exists — idempotent, safe to call every run
+    try:
+        await js.add_stream(StreamConfig(
+            name="ftse",
+            subjects=["ftse.>"],
+            retention=RetentionPolicy.LIMITS,
+            max_age=7 * 24 * 3600,  # retain 7 days of data
+        ))
+        logger.info("NATS stream 'ftse' ensured")
+    except Exception as e:
+        # Stream already exists with same config — fine
+        logger.debug(f"Stream add (already exists): {e}")
+
+    published = 0
+    for stock in stocks:
+        payload = json.dumps({
+            'code':       stock['code'],
+            'name':       stock['name'],
+            'currency':   stock['currency'],
+            'market_cap': stock['market_cap'],
+            'price':      stock['price'],
+            'change':     stock['change'],
+            'change_pct': stock['change_pct'],
+            'scraped_at': stock['scraped_at'].isoformat(),
+        }).encode()
+        await js.publish(NATS_SUBJECT, payload)
+        published += 1
+
+    await nc.drain()
+    logger.info(f"Published {published} stock records to NATS subject '{NATS_SUBJECT}'")
+
+
 def main():
     """Main entry point"""
     logger.info("Starting FTSE 100 scraper")
 
-    # Initialize ClickHouse
     client = init_clickhouse()
-
-    # Scrape data
     stocks = scrape_ftse100()
 
-    # Save to ClickHouse
     if stocks:
         save_to_clickhouse(client, stocks)
+        try:
+            asyncio.run(publish_to_nats(stocks))
+        except Exception as e:
+            # NATS publish failure is non-fatal — ClickHouse already has the data
+            logger.warning(f"NATS publish failed (non-fatal): {e}")
     else:
         logger.warning("No data scraped")
 
